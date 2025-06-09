@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+numpy
+mediapipe
+Pillow
+gtts
+pygame
+pydantic
+scikit-learn
