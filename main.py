@@ -243,6 +243,8 @@ def detect_space_gesture(hand_landmarks, hand_label):
     
     return thumb_extended and other_fingers_folded
 
+# Ganti fungsi speak_and_reset dengan ini:
+
 async def speak_and_reset(text: str):
     """Handle text-to-speech and reset the sentence"""
     global SPEECH_IN_PROGRESS
@@ -252,16 +254,25 @@ async def speak_and_reset(text: str):
         return []
         
     try:
+        # Generate TTS file
         tts = gTTS(text=text, lang='id')
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".mp3") as fp:
+        
+        # Return audio URL instead of playing directly
+        # Untuk server deployment, return audio data atau URL
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
             fp_name = fp.name
             tts.save(fp_name)
-            pygame.mixer.music.load(fp_name)
-            pygame.mixer.music.play()
             
-            while pygame.mixer.music.get_busy():
-                await asyncio.sleep(0.1)
-                
+            # Read audio file as base64 untuk kirim ke frontend
+            with open(fp_name, "rb") as audio_file:
+                audio_data = base64.b64encode(audio_file.read()).decode()
+            
+            # Clean up temp file
+            os.unlink(fp_name)
+            
+            # Simulasi delay (karena tidak play di server)
+            await asyncio.sleep(2)  # Adjust sesuai panjang audio
+            
         return []
         
     except Exception as e:
