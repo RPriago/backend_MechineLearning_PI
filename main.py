@@ -50,7 +50,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables - OPTIMIZED
+# Global variables
 LAST_ENTER_TIME = 1
 ENTER_COOLDOWN = 3.0
 SPEECH_IN_PROGRESS = False
@@ -58,46 +58,26 @@ CAMERA_ENABLED = False
 PREDICTION_CACHE = {}
 MOTION_BUFFER = deque(maxlen=5)
 LAST_PROCESSED_TIME = 0
-# REDUCED processing interval untuk mengurangi beban
-MIN_PROCESSING_INTERVAL = 0.3  # Increased from 0.15 to 0.3 seconds
+MIN_PROCESSING_INTERVAL = 0.15
 GESTURE_BUFFER = deque(maxlen=3)
 LAST_FRAME_HASH = None
-ACTIVE_AUDIO_FILES = set()
 
-# NEW: Adaptive processing variables
-CONSECUTIVE_EMPTY_FRAMES = 0
-MAX_EMPTY_FRAMES = 10  # Skip processing after 10 consecutive empty frames
-LAST_GESTURE_TIME = 0
-GESTURE_TIMEOUT = 2.0  # If no gesture for 2s, reduce processing frequency
-ADAPTIVE_INTERVAL = MIN_PROCESSING_INTERVAL
+# Track active audio files for immediate cleanup
+ACTIVE_AUDIO_FILES = set()
 
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
-        self.client_states: Dict[WebSocket, Dict] = {}
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-        self.client_states[websocket] = {
-            "sentence": [],
-            "last_char_time": 0,
-            "last_frame_time": 0,
-            "processing_active": True
-        }
 
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-        if websocket in self.client_states:
-            del self.client_states[websocket]
+        self.active_connections.remove(websocket)
 
     async def send_personal_message(self, message: dict, websocket: WebSocket):
-        try:
-            await websocket.send_text(json.dumps(message))
-        except:
-            # Connection might be closed
-            self.disconnect(websocket)
+        await websocket.send_text(json.dumps(message))
 
 manager = ConnectionManager()
 
@@ -108,12 +88,10 @@ class PredictionResult(BaseModel):
     camera_state: bool
     processing_time: float = 0
     should_continue: bool = True
+    # Tambahan untuk audio
     should_speak: bool = False
     audio_text: str = ""
     audio_url: Optional[str] = None
-    # NEW: Adaptive processing info
-    processing_interval: float = MIN_PROCESSING_INTERVAL
-    frames_skipped: int = 0
 
 class ImageData(BaseModel):
     image: Optional[str] = None
@@ -122,14 +100,10 @@ class ImageData(BaseModel):
     char_delay: float = 1.5
     initial_delay: float = 2
     camera_state: Optional[bool] = None
-    # NEW: Client-side timing info
-    client_timestamp: Optional[float] = None
-    frame_count: Optional[int] = None
 
-# Helper functions - OPTIMIZED
+# Fungsi helper yang sudah ada (copy dari code asli)
 def calculate_frame_hash(frame_data: str) -> str:
-    # Use shorter hash for better performance
-    return hashlib.md5(frame_data[:1000].encode()).hexdigest()[:6]
+    return hashlib.md5(frame_data.encode()).hexdigest()[:8]
 
 def detect_motion(current_landmarks: List[List[float]]) -> bool:
     if not MOTION_BUFFER or not current_landmarks:
@@ -139,35 +113,28 @@ def detect_motion(current_landmarks: List[List[float]]) -> bool:
     if not last_landmarks:
         return True
     
-    # OPTIMIZED: Check only key landmarks for motion
     total_movement = 0
-    sample_points = [0, 4, 8, 12, 16, 20]  # Only check finger tips and thumb
-    
     for i, hand in enumerate(current_landmarks):
         if i < len(last_landmarks):
-            for j in sample_points:
-                if j*2+1 < len(hand) and j*2+1 < len(last_landmarks[i]):
-                    dx = hand[j*2] - last_landmarks[i][j*2]
-                    dy = hand[j*2+1] - last_landmarks[i][j*2+1]
+            for j in range(0, len(hand), 2):
+                if j + 1 < len(hand) and j + 1 < len(last_landmarks[i]):
+                    dx = hand[j] - last_landmarks[i][j]
+                    dy = hand[j + 1] - last_landmarks[i][j + 1]
                     total_movement += (dx * dx + dy * dy)
     
-    return total_movement > 0.002  # Slightly higher threshold
+    return total_movement > 0.001
 
 def get_cached_prediction(landmarks_key: str) -> Optional[str]:
     return PREDICTION_CACHE.get(landmarks_key)
 
 def cache_prediction(landmarks_key: str, prediction: str):
-    # OPTIMIZED: Limit cache size more aggressively
-    if len(PREDICTION_CACHE) > 50:  # Reduced from 100
-        # Remove oldest entries
-        keys_to_remove = list(PREDICTION_CACHE.keys())[:10]
-        for key in keys_to_remove:
-            del PREDICTION_CACHE[key]
+    if len(PREDICTION_CACHE) > 100:
+        oldest_key = next(iter(PREDICTION_CACHE))
+        del PREDICTION_CACHE[oldest_key]
     PREDICTION_CACHE[landmarks_key] = prediction
 
 def create_landmarks_key(data_aux: List[float]) -> str:
-    # OPTIMIZED: Use fewer points for key generation
-    quantized = [round(x, 1) for x in data_aux[:12]]  # Reduced precision and points
+    quantized = [round(x, 2) for x in data_aux[:20]]
     return str(hash(tuple(quantized)))
 
 def is_gesture_stable(current_char: str) -> bool:
@@ -177,29 +144,6 @@ def is_gesture_stable(current_char: str) -> bool:
     
     recent_gestures = list(GESTURE_BUFFER)[-2:]
     return len(set(recent_gestures)) == 1 and recent_gestures[0] != ""
-
-def should_process_frame(current_time: float, client_timestamp: Optional[float] = None) -> tuple[bool, float]:
-    """
-    Determine if frame should be processed based on adaptive intervals
-    Returns: (should_process, next_interval)
-    """
-    global ADAPTIVE_INTERVAL, LAST_GESTURE_TIME, CONSECUTIVE_EMPTY_FRAMES
-    
-    # Check basic timing
-    if current_time - LAST_PROCESSED_TIME < ADAPTIVE_INTERVAL:
-        return False, ADAPTIVE_INTERVAL
-    
-    # Adaptive processing based on activity
-    time_since_gesture = current_time - LAST_GESTURE_TIME
-    
-    if time_since_gesture > GESTURE_TIMEOUT:
-        # No recent gestures, reduce processing frequency
-        ADAPTIVE_INTERVAL = min(0.5, MIN_PROCESSING_INTERVAL * 2)
-    else:
-        # Recent gesture activity, maintain normal frequency
-        ADAPTIVE_INTERVAL = MIN_PROCESSING_INTERVAL
-    
-    return True, ADAPTIVE_INTERVAL
 
 def decode_base64_image(base64_string):
     try:
@@ -264,8 +208,9 @@ def detect_space_gesture(hand_landmarks, hand_label):
     
     return thumb_extended and other_fingers_folded
 
-# Audio functions (unchanged)
+# SOLUSI BARU: Generate audio langsung ke memory dan cleanup otomatis
 async def generate_speech_response(text: str) -> Optional[str]:
+    """Generate audio file dan return URL untuk frontend"""
     global SPEECH_IN_PROGRESS
     
     if not text.strip():
@@ -274,14 +219,26 @@ async def generate_speech_response(text: str) -> Optional[str]:
     SPEECH_IN_PROGRESS = True
     
     try:
+        # Generate TTS
         tts = gTTS(text=text, lang='id')
+        
+        # Simpan ke file dengan nama unik
         timestamp = int(time.time() * 1000)
         filename = f"speech_{timestamp}.mp3"
         filepath = f"temp_audio/{filename}"
+        
+        # Pastikan direktori ada
         os.makedirs("temp_audio", exist_ok=True)
+        
+        # Simpan file audio
         tts.save(filepath)
+        
+        # Track file untuk cleanup
         ACTIVE_AUDIO_FILES.add(filename)
+        
+        # Return URL yang bisa diakses frontend
         audio_url = f"/audio/{filename}"
+        
         return audio_url
         
     except Exception as e:
@@ -291,15 +248,21 @@ async def generate_speech_response(text: str) -> Optional[str]:
         SPEECH_IN_PROGRESS = False
 
 def cleanup_audio_file(filename: str):
+    """Hapus file audio tertentu"""
     try:
         filepath = f"temp_audio/{filename}"
         if os.path.exists(filepath):
             os.remove(filepath)
+            print(f"Cleaned up audio file: {filename}")
+        
+        # Remove from tracking set
         ACTIVE_AUDIO_FILES.discard(filename)
+        
     except Exception as e:
         print(f"Error cleaning up audio file {filename}: {e}")
 
 def cleanup_all_audio_files():
+    """Hapus semua file audio yang ada"""
     try:
         if os.path.exists("temp_audio"):
             for filename in os.listdir("temp_audio"):
@@ -307,12 +270,15 @@ def cleanup_all_audio_files():
                     filepath = os.path.join("temp_audio", filename)
                     if os.path.exists(filepath):
                         os.remove(filepath)
+            print("Cleaned up all audio files")
         ACTIVE_AUDIO_FILES.clear()
     except Exception as e:
         print(f"Error cleaning up all audio files: {e}")
 
+# Endpoint untuk serve audio files dengan auto-cleanup
 @app.get("/audio/{filename}")
 async def serve_audio(filename: str):
+    """Serve audio files ke frontend dan schedule cleanup"""
     filepath = f"temp_audio/{filename}"
     
     if not os.path.exists(filepath):
@@ -322,6 +288,7 @@ async def serve_audio(filename: str):
         with open(filepath, "rb") as audio_file:
             audio_data = audio_file.read()
         
+        # Schedule cleanup setelah file dikirim
         asyncio.create_task(delayed_cleanup(filename))
         
         return Response(
@@ -335,27 +302,27 @@ async def serve_audio(filename: str):
             }
         )
     except Exception as e:
+        # Cleanup jika terjadi error
         cleanup_audio_file(filename)
         raise HTTPException(status_code=500, detail=f"Error serving audio: {e}")
 
 async def delayed_cleanup(filename: str):
-    await asyncio.sleep(10)
+    """Cleanup file audio setelah delay singkat (untuk memastikan sudah di-download)"""
+    await asyncio.sleep(10)  # Delay 10 detik untuk memastikan audio sudah diputar
     cleanup_audio_file(filename)
 
-# OPTIMIZED: Simplified predict function for better performance
-async def process_gesture_prediction(data: ImageData) -> PredictionResult:
-    global LAST_ENTER_TIME, SPEECH_IN_PROGRESS, CAMERA_ENABLED, LAST_PROCESSED_TIME
-    global LAST_FRAME_HASH, CONSECUTIVE_EMPTY_FRAMES, LAST_GESTURE_TIME
-    
+@app.post("/predict")
+async def predict(data: ImageData):
+    global LAST_ENTER_TIME, SPEECH_IN_PROGRESS, CAMERA_ENABLED, LAST_PROCESSED_TIME, LAST_FRAME_HASH
+
     start_time = time.time()
-    frames_skipped = 0
 
     try:
         # Update camera state
         if data.camera_state is not None:
             CAMERA_ENABLED = data.camera_state
 
-        # Quick exits for non-processing states
+        # Skip processing if speech is in progress or camera is disabled
         if SPEECH_IN_PROGRESS or not CAMERA_ENABLED:
             return PredictionResult(
                 prediction="",
@@ -363,43 +330,33 @@ async def process_gesture_prediction(data: ImageData) -> PredictionResult:
                 last_char_time=data.last_char_time,
                 camera_state=CAMERA_ENABLED,
                 processing_time=time.time() - start_time,
-                should_continue=True,
-                processing_interval=ADAPTIVE_INTERVAL
+                should_continue=True
             )
 
-        # Adaptive processing check
+        # Rate limiting
         current_time = time.time()
-        should_process, next_interval = should_process_frame(current_time, data.client_timestamp)
-        
-        if not should_process:
-            frames_skipped = 1
+        if current_time - LAST_PROCESSED_TIME < MIN_PROCESSING_INTERVAL:
             return PredictionResult(
                 prediction="",
                 sentence=data.sentence,
                 last_char_time=data.last_char_time,
                 camera_state=CAMERA_ENABLED,
                 processing_time=time.time() - start_time,
-                should_continue=False,
-                processing_interval=next_interval,
-                frames_skipped=frames_skipped
+                should_continue=False
             )
 
+        # Check for image
         if not data.image:
-            CONSECUTIVE_EMPTY_FRAMES += 1
             return PredictionResult(
                 prediction="",
                 sentence=data.sentence,
                 last_char_time=data.last_char_time,
                 camera_state=CAMERA_ENABLED,
                 processing_time=time.time() - start_time,
-                should_continue=False,
-                processing_interval=next_interval
+                should_continue=False
             )
 
-        # Reset empty frame counter
-        CONSECUTIVE_EMPTY_FRAMES = 0
-
-        # Duplicate frame detection (optimized)
+        # Duplicate frame detection
         frame_hash = calculate_frame_hash(data.image)
         if frame_hash == LAST_FRAME_HASH:
             return PredictionResult(
@@ -408,10 +365,8 @@ async def process_gesture_prediction(data: ImageData) -> PredictionResult:
                 last_char_time=data.last_char_time,
                 camera_state=CAMERA_ENABLED,
                 processing_time=time.time() - start_time,
-                should_continue=False,
-                processing_interval=next_interval
+                should_continue=False
             )
-        
         LAST_FRAME_HASH = frame_hash
         LAST_PROCESSED_TIME = current_time
 
@@ -419,7 +374,7 @@ async def process_gesture_prediction(data: ImageData) -> PredictionResult:
         frame = decode_base64_image(data.image)
         landmarks_data, results = extract_landmarks_from_frame(frame)
 
-        # Motion detection (optimized)
+        # Motion detection
         if not detect_motion(landmarks_data):
             MOTION_BUFFER.append(landmarks_data)
             return PredictionResult(
@@ -428,13 +383,10 @@ async def process_gesture_prediction(data: ImageData) -> PredictionResult:
                 last_char_time=data.last_char_time,
                 camera_state=CAMERA_ENABLED,
                 processing_time=time.time() - start_time,
-                should_continue=False,
-                processing_interval=next_interval
+                should_continue=False
             )
-        
         MOTION_BUFFER.append(landmarks_data)
 
-        # Process gestures
         current_char = ""
         new_sentence = data.sentence.copy()
         last_char_time = data.last_char_time
@@ -442,8 +394,8 @@ async def process_gesture_prediction(data: ImageData) -> PredictionResult:
         audio_text = ""
         audio_url = None
 
+        # Process gestures
         if results.multi_hand_landmarks:
-            LAST_GESTURE_TIME = current_time  # Update gesture activity
             hands_count = len(results.multi_hand_landmarks)
             data_aux = []
             x_, y_ = [], []
@@ -466,7 +418,7 @@ async def process_gesture_prediction(data: ImageData) -> PredictionResult:
                     elif count_fingers(hand_landmarks, label) == 5:
                         current_char = "enter"
 
-            # Predict letters (optimized)
+            # Predict letters
             if current_char not in ["enter", "space"]:
                 if hands_count == 1:
                     data_aux += [0] * 42
@@ -480,7 +432,7 @@ async def process_gesture_prediction(data: ImageData) -> PredictionResult:
                         cache_prediction(landmarks_key, prediction)
                         current_char = prediction
 
-        # Process actions (unchanged logic)
+        # Process actions
         if current_char == "space":
             if is_gesture_stable(current_char) and (current_time - last_char_time) > data.char_delay:
                 new_sentence.append(" ")
@@ -491,6 +443,7 @@ async def process_gesture_prediction(data: ImageData) -> PredictionResult:
                 LAST_ENTER_TIME = current_time
                 spoken_text = "".join(new_sentence).strip()
                 if spoken_text:
+                    # Generate audio URL
                     audio_url = await generate_speech_response(spoken_text)
                     should_speak = True
                     audio_text = spoken_text
@@ -511,69 +464,24 @@ async def process_gesture_prediction(data: ImageData) -> PredictionResult:
             should_continue=True,
             should_speak=should_speak,
             audio_text=audio_text,
-            audio_url=audio_url,
-            processing_interval=next_interval,
-            frames_skipped=frames_skipped
+            audio_url=audio_url
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in prediction: {str(e)}")
 
-# OPTIMIZED: Keep POST endpoint but discourage frequent use
-@app.post("/predict")
-async def predict(data: ImageData):
-    """
-    Legacy POST endpoint - Use WebSocket for better performance
-    """
-    return await process_gesture_prediction(data)
-
-# MAIN OPTIMIZATION: Enhanced WebSocket with intelligent processing
+# WebSocket endpoint
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    
     try:
         while True:
             data = await websocket.receive_text()
             
             try:
                 request_data = json.loads(data)
-                
-                # Handle different message types
-                if request_data.get("type") == "heartbeat":
-                    await manager.send_personal_message(
-                        {"type": "heartbeat_response", "timestamp": time.time()}, 
-                        websocket
-                    )
-                    continue
-                
-                if request_data.get("type") == "config":
-                    # Handle configuration updates
-                    global MIN_PROCESSING_INTERVAL, GESTURE_TIMEOUT
-                    config = request_data.get("config", {})
-                    if "processing_interval" in config:
-                        MIN_PROCESSING_INTERVAL = max(0.1, config["processing_interval"])
-                    if "gesture_timeout" in config:
-                        GESTURE_TIMEOUT = max(1.0, config["gesture_timeout"])
-                    
-                    await manager.send_personal_message(
-                        {"type": "config_updated", "config": config}, 
-                        websocket
-                    )
-                    continue
-                
-                # Process gesture prediction
                 image_data = ImageData(**request_data)
-                result = await process_gesture_prediction(image_data)
-                
-                # Update client state
-                if websocket in manager.client_states:
-                    manager.client_states[websocket].update({
-                        "sentence": result.sentence,
-                        "last_char_time": result.last_char_time,
-                        "last_frame_time": time.time()
-                    })
-                
+                result = await predict(image_data)
                 await manager.send_personal_message(result.dict(), websocket)
                 
             except json.JSONDecodeError:
@@ -588,17 +496,14 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-# REST endpoints (unchanged)
 @app.post("/camera")
 async def control_camera(control: dict):
-    global CAMERA_ENABLED, CONSECUTIVE_EMPTY_FRAMES, LAST_GESTURE_TIME
+    global CAMERA_ENABLED
     CAMERA_ENABLED = control.get("enable", False)
     
+    # Cleanup semua audio files ketika kamera dimatikan
     if not CAMERA_ENABLED:
         cleanup_all_audio_files()
-        # Reset counters
-        CONSECUTIVE_EMPTY_FRAMES = 0
-        LAST_GESTURE_TIME = 0
     
     return {"success": True, "camera_state": CAMERA_ENABLED}
 
@@ -606,7 +511,10 @@ async def control_camera(control: dict):
 async def clear_sentence():
     global LAST_ENTER_TIME
     LAST_ENTER_TIME = 0
+    
+    # Cleanup audio files ketika sentence di-clear
     cleanup_all_audio_files()
+    
     return {"sentence": [], "last_char_time": 0, "camera_state": CAMERA_ENABLED}
 
 @app.get("/stats")
@@ -617,35 +525,17 @@ async def get_stats():
         "gesture_buffer_size": len(GESTURE_BUFFER),
         "last_processed_time": LAST_PROCESSED_TIME,
         "min_processing_interval": MIN_PROCESSING_INTERVAL,
-        "adaptive_interval": ADAPTIVE_INTERVAL,
-        "consecutive_empty_frames": CONSECUTIVE_EMPTY_FRAMES,
-        "last_gesture_time": LAST_GESTURE_TIME,
-        "active_connections": len(manager.active_connections),
         "active_audio_files": len(ACTIVE_AUDIO_FILES),
-        "performance": {
-            "cache_hit_ratio": len(PREDICTION_CACHE) / max(1, len(PREDICTION_CACHE) + 10),
-            "motion_detection_efficiency": len(MOTION_BUFFER) / 5,
-            "processing_load": "adaptive" if ADAPTIVE_INTERVAL > MIN_PROCESSING_INTERVAL else "normal"
-        }
+        "audio_files_list": list(ACTIVE_AUDIO_FILES)
     }
 
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "camera_enabled": CAMERA_ENABLED,
-        "speech_in_progress": SPEECH_IN_PROGRESS,
-        "active_connections": len(manager.active_connections),
-        "processing_interval": ADAPTIVE_INTERVAL
-    }
-
-# Startup and shutdown events
+# Cleanup semua audio files saat startup
 @app.on_event("startup")
 async def startup_event():
     cleanup_all_audio_files()
     print("Application started - cleaned up existing audio files")
-    print(f"Initial processing interval: {MIN_PROCESSING_INTERVAL}s")
 
+# Cleanup semua audio files saat shutdown
 @app.on_event("shutdown")
 async def shutdown_event():
     cleanup_all_audio_files()
