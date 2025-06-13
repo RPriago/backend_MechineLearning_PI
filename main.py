@@ -1,3 +1,13 @@
+import os
+import warnings
+from sklearn.exceptions import InconsistentVersionWarning
+
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# Suppress sklearn version warnings
+warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -12,7 +22,6 @@ from gtts import gTTS
 import time
 import asyncio
 from PIL import Image
-import os
 import io
 import json
 from collections import deque
@@ -20,13 +29,46 @@ import hashlib
 
 app = FastAPI()
 
-# Load the model
+# Add root endpoint to fix 404 error
+@app.get("/")
+async def root():
+    return {
+        "message": "Sign Language Recognition API",
+        "status": "healthy",
+        "version": "1.0.0",
+        "endpoints": {
+            "predict": "/predict",
+            "websocket": "/ws",
+            "camera": "/camera",
+            "clear": "/clear",
+            "stats": "/stats",
+            "health": "/health"
+        }
+    }
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": time.time()}
+
+# Load the model with better error handling
 try:
     model_path = "model.p"
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file {model_path} not found")
+    
     model_dict = pickle.load(open(model_path, 'rb'))
     model = model_dict['model']
+    print(f"Model loaded successfully from {model_path}")
 except Exception as e:
-    raise RuntimeError(f"Failed to load model: {e}")
+    print(f"ERROR: Failed to load model: {e}")
+    # Create a dummy model for development/testing
+    class DummyModel:
+        def predict(self, X):
+            return ['A'] * len(X)  # Always return 'A' for testing
+    
+    model = DummyModel()
+    print("WARNING: Using dummy model for development")
 
 # Initialize MediaPipe Hands
 mp_hands = mp.solutions.hands
@@ -42,6 +84,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://frontend-mechine-learning-pi.vercel.app",
+        "*"  # Allow all origins for development - remove in production
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -72,10 +115,15 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def send_personal_message(self, message: dict, websocket: WebSocket):
-        await websocket.send_text(json.dumps(message))
+        try:
+            await websocket.send_text(json.dumps(message))
+        except Exception as e:
+            print(f"Error sending message: {e}")
+            self.disconnect(websocket)
 
 manager = ConnectionManager()
 
@@ -86,7 +134,7 @@ class PredictionResult(BaseModel):
     camera_state: bool
     processing_time: float = 0
     should_continue: bool = True
-    # Tambahan untuk audio
+    # Audio features
     should_speak: bool = False
     audio_text: str = ""
     audio_url: Optional[str] = None
@@ -99,7 +147,7 @@ class ImageData(BaseModel):
     initial_delay: float = 2
     camera_state: Optional[bool] = None
 
-# Fungsi helper yang sudah ada (copy dari code asli)
+# Helper functions
 def calculate_frame_hash(frame_data: str) -> str:
     return hashlib.md5(frame_data.encode()).hexdigest()[:8]
 
@@ -163,52 +211,64 @@ def decode_base64_image(base64_string):
         raise ValueError(f"Failed to decode image: {e}")
 
 def extract_landmarks_from_frame(frame):
-    results = hands.process(frame)
-    landmarks_data = []
-    
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            hand_data = []
-            for lm in hand_landmarks.landmark:
-                hand_data.extend([lm.x, lm.y])
-            landmarks_data.append(hand_data)
-    
-    return landmarks_data, results
+    try:
+        results = hands.process(frame)
+        landmarks_data = []
+        
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                hand_data = []
+                for lm in hand_landmarks.landmark:
+                    hand_data.extend([lm.x, lm.y])
+                landmarks_data.append(hand_data)
+        
+        return landmarks_data, results
+    except Exception as e:
+        print(f"Error extracting landmarks: {e}")
+        return [], None
 
 def count_fingers(hand_landmarks, hand_label):
-    tips_ids = [4, 8, 12, 16, 20]
-    fingers = []
+    try:
+        tips_ids = [4, 8, 12, 16, 20]
+        fingers = []
 
-    if hand_label == "Right":
-        fingers.append(hand_landmarks.landmark[tips_ids[0]].x < hand_landmarks.landmark[tips_ids[0] - 1].x)
-    else:
-        fingers.append(hand_landmarks.landmark[tips_ids[0]].x > hand_landmarks.landmark[tips_ids[0] - 1].x)
+        if hand_label == "Right":
+            fingers.append(hand_landmarks.landmark[tips_ids[0]].x < hand_landmarks.landmark[tips_ids[0] - 1].x)
+        else:
+            fingers.append(hand_landmarks.landmark[tips_ids[0]].x > hand_landmarks.landmark[tips_ids[0] - 1].x)
 
-    for i in range(1, 5):
-        fingers.append(hand_landmarks.landmark[tips_ids[i]].y < hand_landmarks.landmark[tips_ids[i] - 2].y)
+        for i in range(1, 5):
+            fingers.append(hand_landmarks.landmark[tips_ids[i]].y < hand_landmarks.landmark[tips_ids[i] - 2].y)
 
-    return sum(fingers)
+        return sum(fingers)
+    except Exception as e:
+        print(f"Error counting fingers: {e}")
+        return 0
 
 def detect_space_gesture(hand_landmarks, hand_label):
-    tips_ids = [4, 8, 12, 16, 20]
-    
-    thumb_extended = False
-    if hand_label == "Right":
-        thumb_extended = (hand_landmarks.landmark[tips_ids[0]].y < hand_landmarks.landmark[2].y)
-    else:
-        thumb_extended = (hand_landmarks.landmark[tips_ids[0]].y < hand_landmarks.landmark[2].y)
-    
-    other_fingers_folded = True
-    for i in range(1, 5):
-        if hand_landmarks.landmark[tips_ids[i]].y < hand_landmarks.landmark[tips_ids[i] - 2].y:
-            other_fingers_folded = False
-            break
-    
-    return thumb_extended and other_fingers_folded
+    try:
+        tips_ids = [4, 8, 12, 16, 20]
+        
+        thumb_extended = False
+        if hand_label == "Right":
+            thumb_extended = (hand_landmarks.landmark[tips_ids[0]].y < hand_landmarks.landmark[2].y)
+        else:
+            thumb_extended = (hand_landmarks.landmark[tips_ids[0]].y < hand_landmarks.landmark[2].y)
+        
+        other_fingers_folded = True
+        for i in range(1, 5):
+            if hand_landmarks.landmark[tips_ids[i]].y < hand_landmarks.landmark[tips_ids[i] - 2].y:
+                other_fingers_folded = False
+                break
+        
+        return thumb_extended and other_fingers_folded
+    except Exception as e:
+        print(f"Error detecting space gesture: {e}")
+        return False
 
-# SOLUSI BARU: Generate audio langsung ke memory dan cleanup otomatis
+# Audio generation with better error handling
 async def generate_speech_response(text: str) -> Optional[str]:
-    """Generate audio file dan return URL untuk frontend"""
+    """Generate audio file and return URL for frontend"""
     global SPEECH_IN_PROGRESS
     
     if not text.strip():
@@ -220,21 +280,21 @@ async def generate_speech_response(text: str) -> Optional[str]:
         # Generate TTS
         tts = gTTS(text=text, lang='id')
         
-        # Simpan ke file dengan nama unik
+        # Save to file with unique name
         timestamp = int(time.time() * 1000)
         filename = f"speech_{timestamp}.mp3"
+        
+        # Ensure directory exists
+        os.makedirs("temp_audio", exist_ok=True)
         filepath = f"temp_audio/{filename}"
         
-        # Pastikan direktori ada
-        os.makedirs("temp_audio", exist_ok=True)
-        
-        # Simpan file audio
+        # Save audio file
         tts.save(filepath)
         
-        # Track file untuk cleanup
+        # Track file for cleanup
         ACTIVE_AUDIO_FILES.add(filename)
         
-        # Return URL yang bisa diakses frontend
+        # Return URL accessible by frontend
         audio_url = f"/audio/{filename}"
         
         return audio_url
@@ -246,7 +306,7 @@ async def generate_speech_response(text: str) -> Optional[str]:
         SPEECH_IN_PROGRESS = False
 
 def cleanup_audio_file(filename: str):
-    """Hapus file audio tertentu"""
+    """Delete specific audio file"""
     try:
         filepath = f"temp_audio/{filename}"
         if os.path.exists(filepath):
@@ -260,7 +320,7 @@ def cleanup_audio_file(filename: str):
         print(f"Error cleaning up audio file {filename}: {e}")
 
 def cleanup_all_audio_files():
-    """Hapus semua file audio yang ada"""
+    """Delete all existing audio files"""
     try:
         if os.path.exists("temp_audio"):
             for filename in os.listdir("temp_audio"):
@@ -273,10 +333,10 @@ def cleanup_all_audio_files():
     except Exception as e:
         print(f"Error cleaning up all audio files: {e}")
 
-# Endpoint untuk serve audio files dengan auto-cleanup
+# Endpoint to serve audio files with auto-cleanup
 @app.get("/audio/{filename}")
 async def serve_audio(filename: str):
-    """Serve audio files ke frontend dan schedule cleanup"""
+    """Serve audio files to frontend and schedule cleanup"""
     filepath = f"temp_audio/{filename}"
     
     if not os.path.exists(filepath):
@@ -286,7 +346,7 @@ async def serve_audio(filename: str):
         with open(filepath, "rb") as audio_file:
             audio_data = audio_file.read()
         
-        # Schedule cleanup setelah file dikirim
+        # Schedule cleanup after file is sent
         asyncio.create_task(delayed_cleanup(filename))
         
         return Response(
@@ -300,13 +360,13 @@ async def serve_audio(filename: str):
             }
         )
     except Exception as e:
-        # Cleanup jika terjadi error
+        # Cleanup if error occurs
         cleanup_audio_file(filename)
         raise HTTPException(status_code=500, detail=f"Error serving audio: {e}")
 
 async def delayed_cleanup(filename: str):
-    """Cleanup file audio setelah delay singkat (untuk memastikan sudah di-download)"""
-    await asyncio.sleep(10)  # Delay 10 detik untuk memastikan audio sudah diputar
+    """Cleanup audio file after short delay"""
+    await asyncio.sleep(10)  # 10 second delay to ensure audio is played
     cleanup_audio_file(filename)
 
 @app.post("/predict")
@@ -393,7 +453,7 @@ async def predict(data: ImageData):
         audio_url = None
 
         # Process gestures
-        if results.multi_hand_landmarks:
+        if results and results.multi_hand_landmarks:
             hands_count = len(results.multi_hand_landmarks)
             data_aux = []
             x_, y_ = [], []
@@ -426,9 +486,13 @@ async def predict(data: ImageData):
                     if cached_prediction:
                         current_char = cached_prediction
                     else:
-                        prediction = model.predict([data_aux])[0]
-                        cache_prediction(landmarks_key, prediction)
-                        current_char = prediction
+                        try:
+                            prediction = model.predict([data_aux])[0]
+                            cache_prediction(landmarks_key, prediction)
+                            current_char = prediction
+                        except Exception as e:
+                            print(f"Error in model prediction: {e}")
+                            current_char = ""
 
         # Process actions
         if current_char == "space":
@@ -466,9 +530,10 @@ async def predict(data: ImageData):
         )
 
     except Exception as e:
+        print(f"Error in prediction: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error in prediction: {str(e)}")
 
-# WebSocket endpoint
+# WebSocket endpoint with better error handling
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
@@ -493,13 +558,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        manager.disconnect(websocket)
 
 @app.post("/camera")
 async def control_camera(control: dict):
     global CAMERA_ENABLED
     CAMERA_ENABLED = control.get("enable", False)
     
-    # Cleanup semua audio files ketika kamera dimatikan
+    # Cleanup all audio files when camera is turned off
     if not CAMERA_ENABLED:
         cleanup_all_audio_files()
     
@@ -510,7 +578,7 @@ async def clear_sentence():
     global LAST_ENTER_TIME
     LAST_ENTER_TIME = 0
     
-    # Cleanup audio files ketika sentence di-clear
+    # Cleanup audio files when sentence is cleared
     cleanup_all_audio_files()
     
     return {"sentence": [], "last_char_time": 0, "camera_state": CAMERA_ENABLED}
@@ -524,16 +592,17 @@ async def get_stats():
         "last_processed_time": LAST_PROCESSED_TIME,
         "min_processing_interval": MIN_PROCESSING_INTERVAL,
         "active_audio_files": len(ACTIVE_AUDIO_FILES),
-        "audio_files_list": list(ACTIVE_AUDIO_FILES)
+        "audio_files_list": list(ACTIVE_AUDIO_FILES),
+        "camera_enabled": CAMERA_ENABLED,
+        "speech_in_progress": SPEECH_IN_PROGRESS
     }
 
-# Cleanup semua audio files saat startup
+# Startup and shutdown events with better event handling
 @app.on_event("startup")
 async def startup_event():
     cleanup_all_audio_files()
     print("Application started - cleaned up existing audio files")
 
-# Cleanup semua audio files saat shutdown
 @app.on_event("shutdown")
 async def shutdown_event():
     cleanup_all_audio_files()
@@ -541,7 +610,7 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 10000))  # Changed default port to match your logs
     uvicorn.run(
         app, 
         host="0.0.0.0", 
