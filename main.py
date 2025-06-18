@@ -265,52 +265,78 @@ def detect_space_gesture(hand_landmarks, hand_label):
         print(f"Error detecting space gesture: {e}")
         return False
 
-def detect_enter_gesture(hand_landmarks, hand_label):
+def detect_enter_gesture_two_hands(results):
     """
-    Detects the "enter" gesture: index finger pointing up, other fingers folded
+    Detects the "enter" gesture: 2 hands with all 10 fingers open/extended
     """
     try:
+        # Must have exactly 2 hands
+        if not results.multi_hand_landmarks or len(results.multi_hand_landmarks) != 2:
+            return False
+        
         tips_ids = [4, 8, 12, 16, 20]  # Thumb, Index, Middle, Ring, Pinky
-        mcp_ids = [2, 5, 9, 13, 17]    # MCP joints
-        pip_ids = [3, 6, 10, 14, 18]   # PIP joints
+        pip_ids = [3, 6, 10, 14, 18]   # PIP joints for comparison
         
-        # Check if index finger is extended (pointing up)
-        index_extended = hand_landmarks.landmark[tips_ids[1]].y < hand_landmarks.landmark[pip_ids[1]].y
+        # Check both hands
+        for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
+            hand_label = results.multi_handedness[i].classification[0].label
+            
+            # Count extended fingers for this hand
+            extended_fingers = 0
+            
+            # Check thumb (different logic for left/right hand)
+            if hand_label == "Right":
+                if hand_landmarks.landmark[tips_ids[0]].x < hand_landmarks.landmark[tips_ids[0] - 1].x:
+                    extended_fingers += 1
+            else:  # Left hand
+                if hand_landmarks.landmark[tips_ids[0]].x > hand_landmarks.landmark[tips_ids[0] - 1].x:
+                    extended_fingers += 1
+            
+            # Check other fingers (index, middle, ring, pinky)
+            for j in range(1, 5):
+                if hand_landmarks.landmark[tips_ids[j]].y < hand_landmarks.landmark[tips_ids[j] - 2].y:
+                    extended_fingers += 1
+            
+            # Each hand must have all 5 fingers extended
+            if extended_fingers < 5:
+                return False
         
-        # Check if other fingers are folded
-        # Thumb check (different logic for left/right hand)
-        thumb_folded = False
-        if hand_label == "Right":
-            thumb_folded = hand_landmarks.landmark[tips_ids[0]].x > hand_landmarks.landmark[pip_ids[0]].x
-        else:
-            thumb_folded = hand_landmarks.landmark[tips_ids[0]].x < hand_landmarks.landmark[pip_ids[0]].x
+        # Additional check: both hands should be visible and reasonably positioned
+        hand1_center = results.multi_hand_landmarks[0].landmark[9]  # Middle finger MCP
+        hand2_center = results.multi_hand_landmarks[1].landmark[9]  # Middle finger MCP
         
-        # Middle finger folded
-        middle_folded = hand_landmarks.landmark[tips_ids[2]].y > hand_landmarks.landmark[pip_ids[2]].y
+        # Hands should not be too far apart (reasonable distance)
+        distance = ((hand1_center.x - hand2_center.x)**2 + (hand1_center.y - hand2_center.y)**2)**0.5
         
-        # Ring finger folded
-        ring_folded = hand_landmarks.landmark[tips_ids[3]].y > hand_landmarks.landmark[pip_ids[3]].y
-        
-        # Pinky folded
-        pinky_folded = hand_landmarks.landmark[tips_ids[4]].y > hand_landmarks.landmark[pip_ids[4]].y
-        
-        # Additional check: make sure index finger is significantly higher than other fingers
-        index_tip_y = hand_landmarks.landmark[tips_ids[1]].y
-        other_fingers_y = [
-            hand_landmarks.landmark[tips_ids[0]].y,  # thumb
-            hand_landmarks.landmark[tips_ids[2]].y,  # middle
-            hand_landmarks.landmark[tips_ids[3]].y,  # ring
-            hand_landmarks.landmark[tips_ids[4]].y   # pinky
-        ]
-        
-        index_highest = all(index_tip_y < other_y - 0.05 for other_y in other_fingers_y)
-        
-        return (index_extended and thumb_folded and middle_folded and 
-                ring_folded and pinky_folded and index_highest)
+        # Allow reasonable distance between hands (not too far, not overlapping)
+        return 0.1 < distance < 0.8
         
     except Exception as e:
-        print(f"Error detecting enter gesture: {e}")
+        print(f"Error detecting two-hand enter gesture: {e}")
         return False
+
+def count_fingers_single_hand(hand_landmarks, hand_label):
+    """
+    Helper function to count extended fingers on a single hand
+    """
+    try:
+        tips_ids = [4, 8, 12, 16, 20]
+        fingers = []
+
+        # Thumb check (different for left/right hand)
+        if hand_label == "Right":
+            fingers.append(hand_landmarks.landmark[tips_ids[0]].x < hand_landmarks.landmark[tips_ids[0] - 1].x)
+        else:
+            fingers.append(hand_landmarks.landmark[tips_ids[0]].x > hand_landmarks.landmark[tips_ids[0] - 1].x)
+
+        # Other fingers check
+        for i in range(1, 5):
+            fingers.append(hand_landmarks.landmark[tips_ids[i]].y < hand_landmarks.landmark[tips_ids[i] - 2].y)
+
+        return sum(fingers)
+    except Exception as e:
+        print(f"Error counting fingers: {e}")
+        return 0
 
 # Audio generation with better error handling
 async def generate_speech_response(text: str) -> Optional[str]:
@@ -519,8 +545,10 @@ async def predict(data: ImageData):
 
                     if detect_space_gesture(hand_landmarks, label):
                         current_char = "space"
-                    elif detect_enter_gesture(hand_landmarks, label):
-                        current_char = "enter"
+
+            # Check for two-hand enter gesture (must be done after processing all hands)
+            if detect_enter_gesture_two_hands(results):
+                current_char = "enter"
 
             # Predict letters
             if current_char not in ["enter", "space"]:
