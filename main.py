@@ -84,7 +84,6 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://frontend-mechine-learning-pi.vercel.app",
-        "*"  # Allow all origins for development - remove in production
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -264,6 +263,53 @@ def detect_space_gesture(hand_landmarks, hand_label):
         return thumb_extended and other_fingers_folded
     except Exception as e:
         print(f"Error detecting space gesture: {e}")
+        return False
+
+def detect_enter_gesture(hand_landmarks, hand_label):
+    """
+    Detects the "enter" gesture: index finger pointing up, other fingers folded
+    """
+    try:
+        tips_ids = [4, 8, 12, 16, 20]  # Thumb, Index, Middle, Ring, Pinky
+        mcp_ids = [2, 5, 9, 13, 17]    # MCP joints
+        pip_ids = [3, 6, 10, 14, 18]   # PIP joints
+        
+        # Check if index finger is extended (pointing up)
+        index_extended = hand_landmarks.landmark[tips_ids[1]].y < hand_landmarks.landmark[pip_ids[1]].y
+        
+        # Check if other fingers are folded
+        # Thumb check (different logic for left/right hand)
+        thumb_folded = False
+        if hand_label == "Right":
+            thumb_folded = hand_landmarks.landmark[tips_ids[0]].x > hand_landmarks.landmark[pip_ids[0]].x
+        else:
+            thumb_folded = hand_landmarks.landmark[tips_ids[0]].x < hand_landmarks.landmark[pip_ids[0]].x
+        
+        # Middle finger folded
+        middle_folded = hand_landmarks.landmark[tips_ids[2]].y > hand_landmarks.landmark[pip_ids[2]].y
+        
+        # Ring finger folded
+        ring_folded = hand_landmarks.landmark[tips_ids[3]].y > hand_landmarks.landmark[pip_ids[3]].y
+        
+        # Pinky folded
+        pinky_folded = hand_landmarks.landmark[tips_ids[4]].y > hand_landmarks.landmark[pip_ids[4]].y
+        
+        # Additional check: make sure index finger is significantly higher than other fingers
+        index_tip_y = hand_landmarks.landmark[tips_ids[1]].y
+        other_fingers_y = [
+            hand_landmarks.landmark[tips_ids[0]].y,  # thumb
+            hand_landmarks.landmark[tips_ids[2]].y,  # middle
+            hand_landmarks.landmark[tips_ids[3]].y,  # ring
+            hand_landmarks.landmark[tips_ids[4]].y   # pinky
+        ]
+        
+        index_highest = all(index_tip_y < other_y - 0.05 for other_y in other_fingers_y)
+        
+        return (index_extended and thumb_folded and middle_folded and 
+                ring_folded and pinky_folded and index_highest)
+        
+    except Exception as e:
+        print(f"Error detecting enter gesture: {e}")
         return False
 
 # Audio generation with better error handling
@@ -473,7 +519,7 @@ async def predict(data: ImageData):
 
                     if detect_space_gesture(hand_landmarks, label):
                         current_char = "space"
-                    elif count_fingers(hand_landmarks, label) == 5:
+                    elif detect_enter_gesture(hand_landmarks, label):
                         current_char = "enter"
 
             # Predict letters
